@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from locale import getdefaultlocale
 from multiprocessing import Queue
 from random import choice as randchoice
-from requests import Request, session
+from requests import session
 from requests.exceptions import HTTPError
 from typing import List, Dict
 from uuid import uuid4
@@ -31,6 +31,7 @@ from legendary.models.manifest import Manifest, ManifestMeta
 from legendary.models.chunk import Chunk
 from legendary.utils.game_workarounds import is_opt_enabled
 from legendary.utils.savegame_helper import SaveGameHelper
+from legendary.utils.manifests import combine_manifests
 
 
 # ToDo: instead of true/false return values for success/failure actually raise an exception that the CLI/GUI
@@ -103,8 +104,8 @@ class LegendaryCore:
             'X-Requested-With': 'XMLHttpRequest',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                           'AppleWebKit/537.36 (KHTML, like Gecko) '
-                          'EpicGamesLauncher/10.16.1-13343695+++Portal+Release-Live '
-                          'UnrealEngine/4.23.0-13343695+++Portal+Release-Live '
+                          'EpicGamesLauncher/10.19.2-14598295+++Portal+Release-Live '
+                          'UnrealEngine/4.23.0-14598295+++Portal+Release-Live '
                           'Chrome/59.0.3071.15 Safari/537.36'
         })
 
@@ -196,6 +197,9 @@ class LegendaryCore:
                     self.egs.get_game_assets(platform=platform_override)]
 
         if not self.lgd.assets or update_assets:
+            # if not logged in, return empty list
+            if not self.egs.user:
+                return []
             self.lgd.assets = [GameAsset.from_egs_json(a) for a in self.egs.get_game_assets()]
 
         return self.lgd.assets
@@ -204,7 +208,13 @@ class LegendaryCore:
         if update:
             self.get_assets(update_assets=True)
 
-        return next(i for i in self.lgd.assets if i.app_name == app_name)
+        try:
+            return next(i for i in self.lgd.assets if i.app_name == app_name)
+        except StopIteration:
+            raise ValueError
+
+    def asset_valid(self, app_name) -> bool:
+        return any(i.app_name == app_name for i in self.lgd.assets)
 
     def get_game(self, app_name, update_meta=False) -> Game:
         if update_meta:
@@ -247,13 +257,17 @@ class LegendaryCore:
 
             if game.is_dlc:
                 _dlc[game.metadata['mainGameItem']['id']].append(game)
-            else:
+            elif not any(i['path'] == 'mods' for i in game.metadata.get('categories', [])):
                 _ret.append(game)
 
         return _ret, _dlc
 
     def get_dlc_for_game(self, app_name):
         game = self.get_game(app_name)
+        if not game:
+            self.log.warning(f'Metadata for {app_name} is missing!')
+            return []
+
         if game.is_dlc:  # dlc shouldn't have DLC
             return []
 
@@ -310,7 +324,9 @@ class LegendaryCore:
 
         params = []
 
-        if wrapper or (wrapper := self.lgd.config.get(app_name, 'wrapper', fallback=None)):
+        if wrapper or (wrapper := self.lgd.config.get(app_name, 'wrapper',
+                                                      fallback=self.lgd.config.get('default', 'wrapper',
+                                                                                   fallback=None))):
             params.extend(shlex.split(wrapper))
 
         if os.name != 'nt' and not disable_wine:
@@ -320,13 +336,14 @@ class LegendaryCore:
                 # check if there's a game specific override
                 wine_bin = self.lgd.config.get(app_name, 'wine_executable', fallback=wine_bin)
 
-            if not self.lgd.config.getboolean(app_name, 'no_wine', fallback=False):
+            if not self.lgd.config.getboolean(app_name, 'no_wine',
+                                              fallback=self.lgd.config.get('default', 'no_wine', fallback=False)):
                 params.append(wine_bin)
 
         params.append(game_exe)
 
         if install.launch_parameters:
-            params.extend(shlex.split(install.launch_parameters))
+            params.extend(shlex.split(install.launch_parameters, posix=False))
 
         params.extend([
               '-AUTH_LOGIN=unused',
@@ -365,10 +382,10 @@ class LegendaryCore:
 
         # get environment overrides from config
         env = os.environ.copy()
+        if 'default.env' in self.lgd.config:
+            env.update(dict(self.lgd.config['default.env']))
         if f'{app_name}.env' in self.lgd.config:
             env.update(dict(self.lgd.config[f'{app_name}.env']))
-        elif 'default.env' in self.lgd.config:
-            env.update(dict(self.lgd.config['default.env']))
 
         if wine_pfx:
             env['WINEPREFIX'] = wine_pfx
@@ -513,6 +530,11 @@ class LegendaryCore:
             if r.status_code != 200:
                 self.log.error(f'Download failed, status code: {r.status_code}')
                 continue
+
+            if not r.content:
+                self.log.error('Manifest is empty! Skipping...')
+                continue
+
             m = self.load_manifest(r.content)
 
             # download chunks required for extraction
@@ -607,12 +629,11 @@ class LegendaryCore:
             if base_url not in base_urls:
                 base_urls.append(base_url)
 
-            params = None
             if 'queryParams' in manifest:
-                params = {p['name']: p['value'] for p in manifest['queryParams']}
-
-            # build url with a prepared request
-            manifest_urls.append(Request('GET', manifest['uri'], params=params).prepare().url)
+                params = '&'.join(f'{p["name"]}={p["value"]}' for p in manifest['queryParams'])
+                manifest_urls.append(f'{manifest["uri"]}?{params}')
+            else:
+                manifest_urls.append(manifest['uri'])
 
         return manifest_urls, base_urls
 
@@ -636,6 +657,17 @@ class LegendaryCore:
 
         return new_manifest_data, base_urls
 
+    def get_delta_manifest(self, base_url, old_build_id, new_build_id):
+        """Get optimized delta manifest (doesn't seem to exist for most games)"""
+        if old_build_id == new_build_id:
+            return None
+
+        r = self.egs.unauth_session.get(f'{base_url}/Deltas/{new_build_id}/{old_build_id}.delta')
+        if r.status_code == 200:
+            return r.content
+        else:
+            return None
+
     def prepare_download(self, game: Game, base_game: Game = None, base_path: str = '',
                          status_q: Queue = None, max_shm: int = 0, max_workers: int = 0,
                          force: bool = False, disable_patching: bool = False,
@@ -644,8 +676,9 @@ class LegendaryCore:
                          platform_override: str = '', file_prefix_filter: list = None,
                          file_exclude_filter: list = None, file_install_tag: list = None,
                          dl_optimizations: bool = False, dl_timeout: int = 10,
-                         repair: bool = False, egl_guid: str = ''
-                         ) -> (DLManager, AnalysisResult, ManifestMeta):
+                         repair: bool = False, repair_use_latest: bool = False,
+                         disable_delta: bool = False, override_delta_manifest: str = '',
+                         egl_guid: str = '') -> (DLManager, AnalysisResult, ManifestMeta):
         # load old manifest
         old_manifest = None
 
@@ -682,10 +715,30 @@ class LegendaryCore:
         self.log.info('Parsing game manifest...')
         new_manifest = self.load_manifest(new_manifest_data)
         self.log.debug(f'Base urls: {base_urls}')
-        self.lgd.save_manifest(game.app_name, new_manifest_data)
         # save manifest with version name as well for testing/downgrading/etc.
         self.lgd.save_manifest(game.app_name, new_manifest_data,
                                version=new_manifest.meta.build_version)
+
+        # check if we should use a delta manifest or not
+        disable_delta = disable_delta or ((override_old_manifest or override_manifest) and not override_delta_manifest)
+        if old_manifest and new_manifest:
+            disable_delta = disable_delta or (old_manifest.meta.build_id == new_manifest.meta.build_id)
+        if old_manifest and new_manifest and not disable_delta:
+            if override_delta_manifest:
+                self.log.info(f'Overriding delta manifest with "{override_delta_manifest}"')
+                delta_manifest_data, _ = self.get_uri_manifest(override_delta_manifest)
+            else:
+                delta_manifest_data = self.get_delta_manifest(randchoice(base_urls),
+                                                              old_manifest.meta.build_id,
+                                                              new_manifest.meta.build_id)
+            if delta_manifest_data:
+                delta_manifest = self.load_manifest(delta_manifest_data)
+                self.log.info(f'Using optimized delta manifest to upgrade from build '
+                              f'"{old_manifest.meta.build_id}" to '
+                              f'"{new_manifest.meta.build_id}"...')
+                combine_manifests(new_manifest, delta_manifest)
+            else:
+                self.log.debug(f'No Delta manifest received from CDN.')
 
         # reuse existing installation's directory
         if igame := self.get_installed_game(base_game.app_name if base_game else game.app_name):
@@ -715,9 +768,11 @@ class LegendaryCore:
         self.log.info(f'Install path: {install_path}')
 
         if repair:
-            # use installed manifest for repairs, do not update to latest version (for now)
-            new_manifest = old_manifest
-            old_manifest = None
+            if not repair_use_latest:
+                # use installed manifest for repairs instead of updating
+                new_manifest = old_manifest
+                old_manifest = None
+
             filename = clean_filename(f'{game.app_name}.repair')
             resume_file = os.path.join(self.lgd.get_tmp_path(), filename)
             force = False
@@ -775,7 +830,11 @@ class LegendaryCore:
         return dlm, anlres, igame
 
     @staticmethod
-    def check_installation_conditions(analysis: AnalysisResult, install: InstalledGame) -> ConditionCheckResult:
+    def check_installation_conditions(analysis: AnalysisResult,
+                                      install: InstalledGame,
+                                      game: Game,
+                                      updating: bool = False,
+                                      ignore_space_req: bool = False) -> ConditionCheckResult:
         results = ConditionCheckResult(failures=set(), warnings=set())
 
         # if on linux, check for eac in the files
@@ -797,12 +856,42 @@ class LegendaryCore:
             results.warnings.add('This game is not marked for offline use (may still work).')
 
         # check if enough disk space is free (dl size is the approximate amount the installation will grow)
-        min_disk_space = analysis.uncompressed_dl_size + analysis.biggest_file_size
+        min_disk_space = analysis.uncompressed_dl_size
+        if updating:
+            min_disk_space += analysis.biggest_file_size
+
+        # todo when resuming, only check remaining files
         _, _, free = shutil.disk_usage(os.path.split(install.install_path)[0])
         if free < min_disk_space:
             free_mib = free / 1024 / 1024
             required_mib = min_disk_space / 1024 / 1024
-            results.failures.add(f'Not enough available disk space! {free_mib:.02f} MiB < {required_mib:.02f} MiB')
+            if ignore_space_req:
+                results.warnings.add(f'Potentially not enough available disk space! '
+                                     f'{free_mib:.02f} MiB < {required_mib:.02f} MiB')
+            else:
+                results.failures.add(f'Not enough available disk space! '
+                                     f'{free_mib:.02f} MiB < {required_mib:.02f} MiB')
+
+        # check if the game actually ships the files or just a uplay installer + packed game files
+        executables = [f for f in analysis.manifest_comparison.added if
+                       f.lower().endswith('.exe') and not f.startswith('Installer/')]
+        if not updating and not any('uplay' not in e.lower() for e in executables) and \
+                any('uplay' in e.lower() for e in executables):
+            results.failures.add('This game requires installation via Uplay and does not ship executable game files.')
+
+        # check if the game launches via uplay
+        if install.executable == 'UplayLaunch.exe':
+            results.warnings.add('This game requires launching via Uplay, it is recommended to install the game '
+                                 'via Uplay instead.')
+
+        # check if the game requires linking to an external account first
+        partner_link = game.metadata.get('customAttributes', {}).get('partnerLinkType', {}).get('value', None)
+        if partner_link == 'ubisoft':
+            results.warnings.add('This game requires linking to and activating on a Ubisoft account first, '
+                                 'this is not currently supported.')
+        elif partner_link:
+            results.warnings.add(f'This game requires linking to "{partner_link}", '
+                                 f'this is currently unsupported and the game may not work.')
 
         return results
 
@@ -896,7 +985,6 @@ class LegendaryCore:
 
         # parse and save manifest to disk for verification step of import
         new_manifest = self.load_manifest(manifest_data)
-        self.lgd.save_manifest(game.app_name, manifest_data)
         self.lgd.save_manifest(game.app_name, manifest_data,
                                version=new_manifest.meta.build_version)
         install_size = sum(fm.file_size for fm in new_manifest.file_manifest_list.elements)
@@ -918,7 +1006,9 @@ class LegendaryCore:
 
     def egl_get_importable(self):
         return [g for g in self.egl.get_manifests()
-                if not self.is_installed(g.app_name) and g.main_game_appname == g.app_name]
+                if not self.is_installed(g.app_name) and
+                g.main_game_appname == g.app_name and
+                self.asset_valid(g.app_name)]
 
     def egl_get_exportable(self):
         if not self.egl.manifests:
@@ -926,6 +1016,9 @@ class LegendaryCore:
         return [g for g in self.get_installed_list() if g.app_name not in self.egl.manifests]
 
     def egl_import(self, app_name):
+        if not self.asset_valid(app_name):
+            raise ValueError(f'To-be-imported game {app_name} not in game asset database!')
+
         self.log.debug(f'Importing "{app_name}" from EGL')
         # load egl json file
         try:
@@ -962,7 +1055,6 @@ class LegendaryCore:
         with open(manifest_filename, 'rb') as f:
             manifest_data = f.read()
         new_manifest = self.load_manifest(manifest_data)
-        self.lgd.save_manifest(lgd_igame.app_name, manifest_data)
         self.lgd.save_manifest(lgd_igame.app_name, manifest_data,
                                version=new_manifest.meta.build_version)
         # mark game as installed
@@ -1046,6 +1138,8 @@ class LegendaryCore:
             # check EGL -> Legendary sync
             for egl_igame in self.egl.get_manifests():
                 if egl_igame.main_game_appname != egl_igame.app_name:  # skip DLC
+                    continue
+                if not self.asset_valid(egl_igame.app_name):  # skip non-owned games
                     continue
 
                 if not self._is_installed(egl_igame.app_name):

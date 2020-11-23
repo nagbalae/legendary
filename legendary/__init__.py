@@ -1,4 +1,4 @@
 """Legendary!"""
 
-__version__ = '0.0.19'
-__codename__ = 'Interloper'
+__version__ = '0.20.2'
+__codename__ = 'Point Insertion'
